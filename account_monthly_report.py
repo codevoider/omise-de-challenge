@@ -7,12 +7,14 @@ import pyspark.sql.functions as sf
 
 import pandas as pd
 
-class account_monthly_report:
-    def __init__(self, tx_file_name):
+class AccountMonthlyReport:
+    def __init__(self, tx_file_name, sql_context):
         findspark.init()
-        
-        self.sc = pyspark.SparkContext(appName='Acme Accounting Monthly Report Pipeline')
-        self.sql = SQLContext(self.sc)
+
+        # self.sc = pyspark.SparkContext(appName='Acme Accounting Monthly Report Pipeline')
+        # self.sql = SQLContext(self.sc)
+
+        self.sql = sql_context
 
         self.data_path = 'data/'
         self.tx_file_name = tx_file_name
@@ -22,6 +24,8 @@ class account_monthly_report:
         self.df_mcc = self.sql.read.csv(self.data_path + self.mcc_file_name, inferSchema = True, header = True)
 
         self.df_tx_type_lookup, self.service_system_type_mapping, self.merchant_business_type_mapping = self.lookup_data_preparation()
+
+        self.df_report = None
 
     def lookup_data_preparation(self):
         # create transaction type lookup
@@ -70,16 +74,20 @@ class account_monthly_report:
         return df.withColumn('date', sf.from_unixtime(sf.unix_timestamp(sf.last_day(df.date)), 'yyyy-MM-dd'))
 
     # get service system type column
-    def with_service_system_type(self, df):   
-        udf_get_service_system_type = sf.udf(lambda payment_method: self.service_system_type_mapping.get(payment_method, ''),
+    def with_service_system_type(self, df):
+        service_system_type_mapping = self.service_system_type_mapping
+
+        udf_get_service_system_type = sf.udf(lambda payment_method: service_system_type_mapping.get(payment_method, ''),
                                             StringType())
-        
+
         return df.withColumn('service_system_type', udf_get_service_system_type(df['payment_method']))
 
     # get merchant business type column
     def with_merchant_business_type(self, df):
+        merchant_business_type_mapping = self.merchant_business_type_mapping
+
         udf_get_merchant_business_type = sf.udf(lambda service_system_type, card_brand: 
-                                                self.merchant_business_type_mapping.get(card_brand, '') 
+                                                merchant_business_type_mapping.get(card_brand, '') 
                                                 if service_system_type == 'CPF'
                                                 else '',
                                                 StringType())
@@ -134,29 +142,64 @@ class account_monthly_report:
                                                     sf.count('amount').alias('number'),
                                                     sf.round(sf.avg('amount'), 2).alias('average_amount'))
 
-    # get terminal average amount range column
-    def get_terminal_average_amount_range(self, average_amount):
-        if average_amount <= 500:
-            return '94560000001'
-        elif average_amount <= 1000:
-            return '94560000002'
-        elif average_amount <= 2000:
-            return '94560000003'
-        elif average_amount <= 5000:
-            return '94560000004'
-        elif average_amount <= 10000:
-            return '94560000005'
-        elif average_amount <= 30000:
-            return '94560000006'
-        else:
-            return '94560000007'
-        return 
-
     def with_terminal_average_amount_range(self, df):
-        udf_get_terminal_average_amount_range = sf.udf(self.get_terminal_average_amount_range, StringType())
+        get_terminal_average_amount_range = lambda average_amount: '94560000001' if average_amount <= 500\
+                                                                    else ('94560000002' if average_amount <= 1000\
+                                                                    else ('94560000003' if average_amount <= 2000\
+                                                                    else ('94560000004' if average_amount <= 5000\
+                                                                    else ('94560000005' if average_amount <= 10000\
+                                                                    else ('94560000006' if average_amount <= 30000
+                                                                    else '94560000007')))))
 
-        return df.withColumn('terminal_average_amount_range', 
-                            udf_get_terminal_average_amount_range(df['average_amount']))
+        udf_get_terminal_average_amount_range = sf.udf(get_terminal_average_amount_range, StringType())
+
+        df = df.withColumn('terminal_average_amount_range', udf_get_terminal_average_amount_range(df['average_amount']))
+
+        return df.drop('average_amount')                
+
+    def generate_report_dataframe(self):
+        # generate column by column via function calls
+        self.df_report = self.with_date(self.df_acme_tx)
+        self.df_report = self.with_service_system_type(self.df_report)
+        self.df_report = self.with_merchant_business_type(self.df_report)
+        self.df_report = self.with_merchant_category_code(self.df_report, self.df_mcc)
+        self.df_report = self.with_transaction_type(self.df_report, self.df_tx_type_lookup)
+
+        # drop unnecessary columns before aggregation
+        self.df_report = self.df_report.drop('merchant_category_id')
+        self.df_report = self.df_report.drop('payment_method')
+        self.df_report = self.df_report.drop('backend_name')
+        self.df_report = self.df_report.drop('card_brand')
+        self.df_report = self.df_report.drop('card_type')
+        self.df_report = self.df_report.drop('card_country_issuer_code')
+        self.df_report = self.df_report.drop('card_country')
+
+        # aggregation for amount and number columns
+        self.df_report = self.with_sum_amount_n_transaction_count(self.df_report)
+
+        # generate fi_code column
+        self.df_report = self.with_fi_code(self.df_report)
+
+        # generate terminal average amount range column and drop helper column
+        self.df_report = self.with_terminal_average_amount_range(self.df_report)
+
+        # column ordering
+        self.df_report = self.df_report.select('fi_code','date', 'service_system_type', 'transaction_type', 'merchant_business_type',
+                                                'merchant_category_code', 'amount', 'number', 'terminal_average_amount_range')
+
+        return self.df_report
+
+    def write_csv_report(self, csv_path='output'):
+        # convert spark dataframe into pandas dataframe
+        pandas_df_report = self.df_report.toPandas()
+
+        for u in pandas_df_report['date'].unique():
+            file_name = csv_path + '/ACME_{0}.csv'.format(u.replace('-', '')) 
+            pandas_df_report[pandas_df_report['date'] == u].to_csv(file_name, sep='|', line_terminator='\r\n', index=False)
+
+        print('Reporting Records: {}'.format(self.df_report.count()))
+
+        return
 
 if __name__ == '__main__':
     None
