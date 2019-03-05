@@ -178,17 +178,23 @@ df_report = with_terminal_average_amount_range(df_report)
 df_report = df_report.drop('average_amount')
 
 # column ordering
-df_report = df_report.select('fi_code','date', 'service_system_type', 'transaction_type', 'merchant_business_type',
-                             'merchant_category_code', 'amount', 'number', 'terminal_average_amount_range')
+column_order_list = ['fi_code','date', 'service_system_type', 'transaction_type', 'merchant_business_type',
+                             'merchant_category_code', 'amount', 'number', 'terminal_average_amount_range']
 
-# convert spark dataframe into pandas dataframe
-pandas_df_report = df_report.toPandas()
+df_report = df_report.select(column_order_list)
 
-# write csv file based on date column
-for u in pandas_df_report['date'].unique():
-    file_name = 'ACME_{0}.csv'.format(u.replace('-', '')) 
-    pandas_df_report[pandas_df_report['date'] == u].to_csv(file_name, sep='|', line_terminator='\r\n', index=False)
+df_report.write.format("csv").save('output_test')
 
-print('Reporting Records: {}'.format(df_report.count()))
+# def write_csv_file(collection):
+#     for row in collection:
+#         data = [str(rec) for rec in row]
+#         write_line = '|'.join(data)
+#         f = open("demofile.txt", "a")
+#         f.write(write_line + '\r\n')
+#     return 'Y'
+
+# xxx = df_report.collect()
+
+# write_csv_file(df_report.collect())
 
 sc.stop()
